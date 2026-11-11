@@ -8,7 +8,7 @@ import kotlin.math.abs
 import kotlin.math.max
 
 @TeleOp(name = "Basic Drive")
-class MecanumDrive : LinearOpMode() {
+class BasicMecanumDrive : LinearOpMode() {
     lateinit var leftBack: DcMotor;
     lateinit var rightBack: DcMotor;
     lateinit var leftFront: DcMotor;

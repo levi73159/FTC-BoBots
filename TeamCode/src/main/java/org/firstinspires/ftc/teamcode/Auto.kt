@@ -21,284 +21,310 @@
  */
 package org.firstinspires.ftc.teamcode
 
+import com.acmerobotics.dashboard.FtcDashboard
+import com.acmerobotics.dashboard.telemetry.TelemetryPacket
+import com.acmerobotics.roadrunner.Action
+import com.acmerobotics.roadrunner.Pose2d
+import com.acmerobotics.roadrunner.SequentialAction
+import com.acmerobotics.roadrunner.TranslationalVelConstraint
+import com.acmerobotics.roadrunner.Vector2d
+import com.acmerobotics.roadrunner.ftc.runBlocking
 import com.qualcomm.robotcore.eventloop.opmode.Autonomous
 import com.qualcomm.robotcore.eventloop.opmode.LinearOpMode
-import com.qualcomm.robotcore.eventloop.opmode.OpMode
-import com.qualcomm.robotcore.eventloop.opmode.TeleOp
 import com.qualcomm.robotcore.hardware.CRServo
 import com.qualcomm.robotcore.hardware.DcMotor
-import com.qualcomm.robotcore.hardware.DcMotor.ZeroPowerBehavior
 import com.qualcomm.robotcore.hardware.DcMotorEx
 import com.qualcomm.robotcore.hardware.DcMotorSimple
 import com.qualcomm.robotcore.hardware.PIDFCoefficients
 import com.qualcomm.robotcore.util.ElapsedTime
-import kotlin.math.abs
-import kotlin.math.max
-import kotlin.time.Duration.Companion.seconds
 
-/*
- * This file includes a teleop (driver-controlled) file for the goBILDA® StarterBot with Mecanum
- * Wheels for the 2026-2027 FIRST® Tech Challenge. On top of a mecanum wheel drivetrain, it uses
- * one motor driving an intake roller, two servos which pull elements out of corners, and a high-speed
- * launcher motor.
- *
- * Likely the most niche concept we'll use in this example is closed-loop motor velocity control.
- * This control method reads the current speed as reported by the motor's encoder and applies a varying
- * amount of power to reach, and then hold a target velocity. The FTC SDK calls this control method
- * "RUN_USING_ENCODER". This contrasts to the default "RUN_WITHOUT_ENCODER" where you control the power
- * applied to the motor directly.
- * Since the dynamics of a launcher wheel system varies greatly from those of most other FTC mechanisms,
- * we will also need to adjust the "PIDF" coefficients with some that are a better fit for our application.
+/**
+ * Select RED/BLUE during INIT; start preloaded and aimed at that alliance's hive.
+ * Four timed feeder pulses, then park using Road Runner.
+ * FEED_SECONDS must be tested: without a ball sensor, pulses do not verify shots.
  */
-@Autonomous(name = "Auto", group = "StarterBot") //@Disabled
+@Autonomous(name = "Auto", group = "StarterBot")
 class Auto : LinearOpMode() {
-    // Declare OpMode members.
-    private lateinit var leftFrontDrive: DcMotor
-    private lateinit var leftBackDrive: DcMotor
-    private lateinit var rightFrontDrive: DcMotor
-    private lateinit var rightBackDrive: DcMotor
-    private lateinit var launcher: DcMotorEx
-    private lateinit var intake: DcMotor
-    private lateinit var leftIntakeServo: CRServo
-    private lateinit var rightIntakeServo: CRServo
-    private lateinit var windmillServo: CRServo
+    private enum class TeamColor { RED, BLUE }
+    private enum class StartPosition { HIVE, DELAYED }
 
+    private var teamColor = TeamColor.RED
+    private var startPosition = StartPosition.HIVE
+    private var trustedMode = false
+    private var delaySeconds = 10
 
-    /*
-     * These two variables are used to control the velocity of the launcher motor.
-     * They are both in encoder ticks per second. The motors we use in the FIRST Tech Challenge
-     * have encoders with a resolution of 28 ticks per revolution. We can convert this to RPM
-     * by dividing the value by 28, to get to revolutions per second, before multiplying by 60
-     * to get revolutions per minute.
-     * We pass the target velocity variable to our motor to set the goal. We use the min velocity
-     * in the launch() function to only run the windmill servo when the motor is spinning fast
-     * enough to make a successful throw.
-     */
-    val LAUNCHER_TARGET_VELOCITY: Int = 1320 //2678 RPM
-    val LAUNCHER_MIN_VELOCITY: Int = 1290 //2571 RPM
+    private fun selectedStart(): Pose2d {
+        val pose = toSided(
+            if (startPosition == StartPosition.HIVE) START_POSE else DELAYED_START_RED
+        )
+        // Trusted Mode means the robot is ALREADY physically facing the goal.
+        // Initialize odometry to that orientation; do not command a 180-degree turn.
+        return if (startPosition == StartPosition.DELAYED && trustedMode)
+            Pose2d(pose.position, pose.heading.toDouble() + Math.PI)
+        else pose
+    }
 
+    private fun runDriveAction(action: Action): Boolean {
+        while (opModeIsActive()) {
+            val packet = TelemetryPacket(false)
+            BiobuzzField.apply(packet)
+            val running = action.run(packet)
+            FtcDashboard.getInstance().sendTelemetryPacket(packet)
+            if (!running) return true
+            idle()
+        }
+        return false
+    }
 
-    /*
-     * These four variables store the power we need to apply to the motors. In other cases, we may
-     * choose to declare these variables inside the mecanumDrive() function, instead we declare them
-     * here so that we can access them in our main loop for telemetry.
-     */
-    var leftFrontPower: Double = 0.0
-    var rightFrontPower: Double = 0.0
-    var leftBackPower: Double = 0.0
-    var rightBackPower: Double = 0.0
-    var flip: Boolean = false;
+    // BIOBUZZ's opposite-corner layout has 180-degree rotational symmetry.
+    // Transform every waypoint and the starting heading together.
+    private fun toSided(point: Vector2d): Vector2d =
+        if (teamColor == TeamColor.RED) point else Vector2d(-point.x, -point.y)
 
-    // Create a variable to set to the intake.
-    var intakePower: Double = 0.0
+    private fun toSided(pose: Pose2d): Pose2d =
+        if (teamColor == TeamColor.RED) pose else Pose2d(
+            toSided(pose.position),
+            pose.heading.toDouble() + Math.PI
+        )
 
-    /*
-     * Code to run ONCE when the driver hits INIT
-     */
+    companion object {
+        // Shooter settings match BobStarterbotTeleop.java (ticks per second).
+        private const val LAUNCHER_TARGET_VELOCITY = 1250.0
+        private const val LAUNCHER_MIN_VELOCITY = 1200.0
+        private const val BALL_COUNT = 6 // we can carry 4 balls but we shooting 6 just in case
+        private const val FEED_SECONDS = 0.35
+        private const val RECOVERY_SECONDS = 0.45
+        private const val SHOT_TIMEOUT_SECONDS = 4.0
+        private const val PARK_MAX_VELOCITY = 20.0 // inches per second
+        private const val FINAL_APPROACH_VELOCITY = 8.0
+        private const val RED_TRAVEL_LANE_X = -46.0
+
+        // Recorded red-side poses from the previous Auto.kt.
+        private val START_POSE = Pose2d(-15.58, -63.32, Math.toRadians(-90.0))
+        // Supplied BLUE pose: (-11.53, 64.05, -89 degrees).
+        // Store its 180-degree counterpart so toSided() handles both alliances.
+        private val DELAYED_START_RED = Pose2d(-13.44, 61.68, Math.toRadians(-90.8))
+        private const val RED_TURN_CLEARANCE_Y = -48.0
+        // Retain the team's latest park target. Center is 6 inches from the wall;
+        // verify the robot footprint and localization error fit this clearance.
+        private val PARK_POSITION = Vector2d(-66.0, 38.91 + 15.0)
+    }
+
     override fun runOpMode() {
-        leftFrontDrive = hardwareMap.get(DcMotor::class.java, "left_front_drive")
-        rightFrontDrive = hardwareMap.get(DcMotor::class.java, "right_front_drive")
-        leftBackDrive = hardwareMap.get(DcMotor::class.java, "left_back_drive")
-        rightBackDrive = hardwareMap.get(DcMotor::class.java, "right_back_drive")
-        intake = hardwareMap.get(DcMotor::class.java, "intake")
-        launcher = hardwareMap.get(DcMotorEx::class.java, "launcher")
-        windmillServo = hardwareMap.get(CRServo::class.java, "windmillServo")
-        leftIntakeServo = hardwareMap.get(CRServo::class.java, "left_intake_servo")
-        rightIntakeServo = hardwareMap.get(CRServo::class.java, "right_intake_servo")
+        val intake = hardwareMap.get(DcMotor::class.java, "intake")
+        val launcher = hardwareMap.get(DcMotorEx::class.java, "launcher")
+        val feeder = hardwareMap.get(CRServo::class.java, "windmillServo")
 
-        leftFrontDrive.direction = DcMotorSimple.Direction.REVERSE
-        rightFrontDrive.direction = DcMotorSimple.Direction.FORWARD
-        leftBackDrive.direction = DcMotorSimple.Direction.REVERSE
-        rightBackDrive.direction = DcMotorSimple.Direction.FORWARD
-
-
-        rightIntakeServo.direction = DcMotorSimple.Direction.REVERSE
-        windmillServo.direction = DcMotorSimple.Direction.FORWARD
-
-        leftFrontDrive.zeroPowerBehavior = ZeroPowerBehavior.BRAKE
-        rightFrontDrive.zeroPowerBehavior = ZeroPowerBehavior.BRAKE
-        leftBackDrive.zeroPowerBehavior = ZeroPowerBehavior.BRAKE
-        rightBackDrive.zeroPowerBehavior = ZeroPowerBehavior.BRAKE
-        intake.zeroPowerBehavior = ZeroPowerBehavior.BRAKE
-
+        // Explicitly set directions because earlier OpModes can change them.
+        intake.direction = DcMotorSimple.Direction.FORWARD
+        launcher.direction = DcMotorSimple.Direction.FORWARD
+        feeder.direction = DcMotorSimple.Direction.FORWARD
+        intake.zeroPowerBehavior = DcMotor.ZeroPowerBehavior.BRAKE
+        intake.mode = DcMotor.RunMode.RUN_WITHOUT_ENCODER
         launcher.mode = DcMotor.RunMode.RUN_USING_ENCODER
-
         launcher.setPIDFCoefficients(
             DcMotor.RunMode.RUN_USING_ENCODER,
             PIDFCoefficients(40.0, 0.0, 0.0, 12.5)
         )
+        intake.power = 0.0
+        feeder.power = 0.0
+        launcher.velocity = 0.0
 
-        leftIntakeServo.power = 0.0
-        rightIntakeServo.power = 0.0
-        windmillServo.power = 0.0
+        var drive: MecanumDrive? = null
+        try {
+            val robotDrive = MecanumDrive(hardwareMap, START_POSE)
+            drive = robotDrive
+            robotDrive.rightFront.direction = DcMotorSimple.Direction.FORWARD
+            robotDrive.rightBack.direction = DcMotorSimple.Direction.FORWARD
+            val driveMotors = listOf(
+                robotDrive.leftFront, robotDrive.leftBack,
+                robotDrive.rightFront, robotDrive.rightBack
+            )
+            driveMotors.forEach {
+                it.power = 0.0
+                it.mode = DcMotor.RunMode.RUN_WITHOUT_ENCODER
+            }
 
-        super.telemetry.addData("Status", "Initialized")
-        super.telemetry.update()
-
-        var team_blue = false;
-        var no_shoot = false;
-        var park_only = false;
-        while (super.opModeInInit()) {
-            super.telemetry.clearAll();
-            super.telemetry.addData("Status", "Initialized")
-            super.telemetry.addData("Team", if (team_blue) "BLUE" else "RED")
-            super.telemetry.addData("No shoot", no_shoot)
-            super.telemetry.addData("Park only", park_only)
-            super.telemetry.addLine("Press X for blue team and B for red team");
-            super.telemetry.addLine("Press Y to toggle no shoot auto");
-            super.telemetry.addLine("Press A to toggle Park only mode");
-            super.telemetry.update();
-
-            if (super.gamepad1.x) team_blue = true;
-            else if (super.gamepad1.b) team_blue = false;
-
-            if (super.gamepad1.yWasPressed()) no_shoot = !no_shoot;
-            if (super.gamepad1.aWasPressed()) park_only = !park_only
-        }
-
-        super.waitForStart();
-
-        super.telemetry.clearAll();
-
-        super.telemetry.addData("Status", "Running");
-        super.telemetry.addData("State", "S1 (Line up)");
-
-        super.telemetry.update()
-
-        if (!(no_shoot || park_only)) {
-            val shootHold = 0.85
-            val shootDelay = 0.3
-            val amount = 4;
-
-            var shootTime = ElapsedTime()
-            for (i in 0..<amount) {
-                super.telemetry.addData("balls shot", i)
-                super.telemetry.update()
-                while (shootTime.seconds() <= shootHold) {
-                    launch(true)
-                    if (super.isStopRequested) return
+            while (opModeInInit()) {
+                if (gamepad1.xWasPressed()) teamColor = TeamColor.BLUE
+                if (gamepad1.bWasPressed()) teamColor = TeamColor.RED
+                if (gamepad1.aWasPressed()) {
+                    startPosition = if (startPosition == StartPosition.HIVE)
+                        StartPosition.DELAYED else StartPosition.HIVE
+                    trustedMode = false
                 }
-                shootTime = ElapsedTime()
-                while (shootTime.seconds() <= shootDelay) {
-                    windmillServo.power = 0.0
-                    if (super.isStopRequested) return
+                if (gamepad1.rightBumperWasPressed()) {
+                    startPosition = StartPosition.DELAYED
+                    trustedMode = false
+                }
+                if (gamepad1.leftBumperWasPressed()) {
+                    startPosition = StartPosition.HIVE
+                    trustedMode = false
+                }
+                if (gamepad1.yWasPressed() && startPosition == StartPosition.DELAYED)
+                    trustedMode = !trustedMode
+                if (gamepad1.dpadUpWasPressed()) delaySeconds = (delaySeconds + 1).coerceAtMost(20)
+                if (gamepad1.dpadDownWasPressed()) delaySeconds = (delaySeconds - 1).coerceAtLeast(0)
+
+                val selectedStart = selectedStart()
+                val selectedPark = toSided(PARK_POSITION)
+                telemetry.addLine("X = BLUE | B = RED")
+                telemetry.addLine("A = HIVE / DELAYED start")
+                telemetry.addLine("RB = select DELAYED | LB = select HIVE (Trusted resets OFF)")
+                telemetry.addLine("Y = Trusted Mode (already aimed; flips starting heading 180 deg)")
+                telemetry.addLine("D-pad up/down = delay +/- 1 second (0-20)")
+                telemetry.addData("Alliance", teamColor)
+                telemetry.addData("Starting position", startPosition)
+                telemetry.addData("Delay (delayed start only)", delaySeconds)
+                telemetry.addData("Trusted Mode (delayed start only)", trustedMode)
+                telemetry.addData("Shooting plan", when {
+                    startPosition == StartPosition.HIVE -> "SHOOT NOW at hive, then PARK"
+                    trustedMode -> "WAIT ${delaySeconds}s, SHOOT HERE, then PARK"
+                    else -> "WAIT ${delaySeconds}s, DRIVE TO HIVE, SHOOT, then PARK"
+                })
+                telemetry.addData("Start (in)", "x %.2f, y %.2f",
+                    selectedStart.position.x, selectedStart.position.y)
+                telemetry.addData("Start heading (deg)",
+                    Math.toDegrees(selectedStart.heading.toDouble()))
+                telemetry.addData("Park (in)", "x %.2f, y %.2f",
+                    selectedPark.x, selectedPark.y)
+                telemetry.addLine("Place robot at the displayed starting position AND heading.")
+                telemetry.addLine("Four feed pulses, inset travel lane, then slow park approach.")
+                telemetry.update()
+                sleep(20)
+            }
+            waitForStart()
+            if (isStopRequested) return
+
+            val startPose = selectedStart()
+            robotDrive.localizer.setPose(startPose)
+
+            if (startPosition == StartPosition.DELAYED) {
+                val delay = ElapsedTime()
+                while (opModeIsActive() && delay.seconds() < delaySeconds) {
+                    robotDrive.updatePoseEstimate()
+                    telemetry.addData("Status", "Waiting")
+                    telemetry.addData("Next", if (trustedMode) "Shoot here" else "Drive to hive")
+                    telemetry.addData("Seconds remaining", "%.1f", delaySeconds - delay.seconds())
+                    telemetry.update()
+                    sleep(20)
+                }
+                if (!opModeIsActive()) return
+
+                if (!trustedMode) {
+                    telemetry.addData("Status", "Driving to hive; shooter OFF")
+                    telemetry.update()
+                    val currentPose = robotDrive.localizer.getPose()
+                    val hivePose = toSided(START_POSE)
+                    // Pull away from the wall before rotating, then approach hive.
+                    val approach = robotDrive.actionBuilder(currentPose)
+                        .strafeTo(Vector2d(currentPose.position.x, hivePose.position.y), TranslationalVelConstraint(PARK_MAX_VELOCITY))
+                        .strafeTo(hivePose.position, TranslationalVelConstraint(PARK_MAX_VELOCITY))
+                        .build()
+                    runBlocking(
+                        approach
+                    )
+                    // A time-finished trajectory is not proof the robot arrived.
+                    // Do not feed balls at the delayed start if the drive failed.
+                    robotDrive.updatePoseEstimate()
+                    val actual = robotDrive.localizer.getPose()
+                    val positionError = Math.hypot(
+                        actual.position.x - hivePose.position.x,
+                        actual.position.y - hivePose.position.y
+                    )
+                    val headingDelta = actual.heading.toDouble() - hivePose.heading.toDouble()
+                    val headingError = Math.abs(Math.atan2(Math.sin(headingDelta), Math.cos(headingDelta)))
+                    if (positionError > 3.0 || headingError > Math.toRadians(15.0)) {
+                        telemetry.addData("Status", "Hive not reached: shooting cancelled")
+                        telemetry.addData("Position error (in)", positionError)
+                        telemetry.addData("Heading error (deg)", Math.toDegrees(headingError))
+                        telemetry.update()
+                        while (opModeIsActive()) sleep(50)
+                        return
+                    }
                 }
             }
-            launch(false)
 
-            shootTime = ElapsedTime()
-            while (shootTime.seconds() <= shootDelay) {
-                if (super.isStopRequested) return
+            // Stay inward of the wall flowers until past them, then approach park.
+            // These waypoints need a physical clearance check for the robot footprint.
+            robotDrive.updatePoseEstimate()
+            val shootingPose = robotDrive.localizer.getPose()
+            val upShootingPose = Pose2d(Vector2d(shootingPose.position.x, shootingPose.position.y + if (teamColor == TeamColor.RED) -25 else 25), shootingPose.heading)
+            val parkFoward = robotDrive.actionBuilder(shootingPose).strafeTo(upShootingPose.position).build()
+            val park = robotDrive.actionBuilder(if (trustedMode) upShootingPose else shootingPose)
+                .strafeTo(
+                    Vector2d(toSided(Vector2d(RED_TRAVEL_LANE_X, 0.0)).x,
+                        shootingPose.position.y),
+                    TranslationalVelConstraint(PARK_MAX_VELOCITY)
+                )
+                .strafeTo(
+                    toSided(Vector2d(RED_TRAVEL_LANE_X, PARK_POSITION.y)),
+                    TranslationalVelConstraint(PARK_MAX_VELOCITY)
+                )
+                .strafeTo(toSided(PARK_POSITION),
+                    TranslationalVelConstraint(FINAL_APPROACH_VELOCITY))
+                .build()
+
+            if (!opModeIsActive()) return
+            telemetry.addData("Status", "Shooting")
+            telemetry.update()
+            launcher.velocity = LAUNCHER_TARGET_VELOCITY
+            for (shot in 1..BALL_COUNT) {
+                if (!opModeIsActive()) return
+
+                val timeout = ElapsedTime()
+                val interval = ElapsedTime()
+                var feedTime = 0.0
+                var wasFeeding = false
+                while (opModeIsActive() && feedTime < FEED_SECONDS &&
+                    timeout.seconds() < SHOT_TIMEOUT_SECONDS
+                ) {
+                    // Count only time the feeder was powered; pause on speed dips.
+                    val dt = interval.seconds()
+                    interval.reset()
+                    if (wasFeeding) feedTime += dt
+                    val ready = launcher.velocity >= LAUNCHER_MIN_VELOCITY &&
+                        feedTime < FEED_SECONDS
+                    feeder.power = if (ready) 1.0 else 0.0
+                    intake.power = if (ready) 0.5 else 0.0
+                    wasFeeding = ready
+                    telemetry.addData("Feed pulse", "%d / %d", shot, BALL_COUNT)
+                    telemetry.addData("Launcher ticks/sec", launcher.velocity)
+                    telemetry.update()
+                    sleep(10)
+                }
+                feeder.power = 0.0
+                intake.power = 0.0
+                if (!opModeIsActive()) return
+                if (feedTime < FEED_SECONDS) {
+                    telemetry.addLine("Shooter timeout: skipping remaining pulses and parking.")
+                    telemetry.update()
+                    break
+                }
+                sleep((RECOVERY_SECONDS * 1000).toLong())
             }
-        }
 
-        var driveTime = ElapsedTime()
+            launcher.velocity = 0.0
+            feeder.power = 0.0
+            intake.power = 0.0
+            telemetry.addData("Status", "Parking")
+            telemetry.update()
 
-        if (park_only) {
-            val forwardSeconds = 0.2;
-            val strafeSeconds = 0.5;
-
-            mecanumDrive(-0.75, 0.0, 0.0);
-            while (driveTime.seconds() <= forwardSeconds) {
-                if (super.isStopRequested) return
+            if (trustedMode) {
+                runDriveAction(parkFoward)
             }
-
-
-            driveTime = ElapsedTime()
-            mecanumDrive(0.0, 0.75, 0.0);
-            while (driveTime.seconds() <= strafeSeconds) {
-                if (super.isStopRequested) return
+            runDriveAction(park)
+        } finally {
+            feeder.power = 0.0
+            intake.power = 0.0
+            launcher.velocity = 0.0
+            launcher.power = 0.0
+            drive?.let {
+                it.leftFront.power = 0.0
+                it.leftBack.power = 0.0
+                it.rightFront.power = 0.0
+                it.rightBack.power = 0.0
             }
-
-            driveTime = ElapsedTime()
-            mecanumDrive(0.75, 0.0, 0.0);
-            while (driveTime.seconds() <= forwardSeconds) {
-                if (super.isStopRequested) return
-            }
-        } else {
-            val forwardSeconds = 2.4
-            val strafeSeconds = 0.45
-            val toWallSeconds = 0.50
-
-            driveTime = ElapsedTime()
-            mecanumDrive(0.0, 0.75, 0.0)
-            while (driveTime.seconds() <= toWallSeconds) {
-                if (super.isStopRequested) return
-            }
-
-            mecanumDrive(-0.75, 0.0, 0.0);
-            while (driveTime.seconds() <= forwardSeconds) {
-                if (super.isStopRequested) return
-            }
-
-
-            driveTime = ElapsedTime()
-            mecanumDrive(0.0, 0.75, 0.0);
-            while (driveTime.seconds() <= strafeSeconds) {
-                if (super.isStopRequested) return
-            }
-        }
-
-
-    }
-
-    fun mecanumDrive(forward: Double, strafe: Double, rotate: Double) {
-        leftFrontPower = forward + strafe + rotate
-        rightFrontPower = forward - strafe - rotate
-        leftBackPower = forward - strafe + rotate
-        rightBackPower = forward + strafe - rotate
-
-        var max = max(abs(leftFrontPower), abs(rightFrontPower))
-        max = max(max, abs(leftBackPower))
-        max = max(max, abs(rightBackPower))
-
-        if (max > 1.0) {
-            leftFrontPower /= max
-            rightFrontPower /= max
-            leftBackPower /= max
-            rightBackPower /= max
-        }
-
-        if (flip) {
-            leftFrontPower *= -1;
-            rightFrontPower *= -1;
-            leftBackPower *= -1;
-            rightBackPower *= -1;
-        }
-
-        /*
-         * Send calculated power to wheels
-         */
-        leftFrontDrive!!.power = leftFrontPower
-        rightFrontDrive!!.power = rightFrontPower
-        leftBackDrive!!.power = leftBackPower
-        rightBackDrive!!.power = rightBackPower
-    }
-
-    fun launch(should: Boolean) {
-        /*
-         * Calling gamepad1.right_bumper returns a boolean which will be true if the bumper is
-         * held down, and false if it is not. Notably, this will continue to be true for every
-         * cycle of our code that the driver holds down that bumper.
-         * The first step of our launch() function is checking to see if the user is currently
-         * holding down the right gamepad. If they are, then we want to start spinning up the launcher.
-         * Otherwise, we start spinning the launcher down.
-         */
-        if (should) {
-            launcher!!.velocity = LAUNCHER_TARGET_VELOCITY.toDouble()
-        }
-
-        /*
-         * Here we ask if the driver is currently pressing the right bumper, AND the launcher is
-         * spinning fast enough to make a successful shot. If it is, then we will turn on the
-         * windmill servo to start feeding the elements into the launcher motor. We also
-         * add some power to the intake power. This can sometimes help dislodge stuck elements from
-         * inside the hopper.
-         */
-        if (should && launcher!!.velocity > LAUNCHER_MIN_VELOCITY) {
-            windmillServo!!.power = 1.0
-        } else {
-            windmillServo!!.power = 0.0
         }
     }
 }

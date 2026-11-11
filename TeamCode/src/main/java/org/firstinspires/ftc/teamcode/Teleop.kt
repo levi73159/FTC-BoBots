@@ -69,8 +69,9 @@ class BioBuzzStarterbotTeleopMecanum : OpMode() {
      * in the launch() function to only run the windmill servo when the motor is spinning fast
      * enough to make a successful throw.
      */
-    val LAUNCHER_TARGET_VELOCITY: Int = 4500
-    val LAUNCHER_MIN_VELOCITY: Int = 4450
+    val LAUNCHER_TARGET_VELOCITY: Int = 1450 //2678 RPM
+    val LAUNCHER_MIN_VELOCITY: Int = 1400 //2571 RPM
+
 
 
     /*
@@ -286,8 +287,8 @@ class BioBuzzStarterbotTeleopMecanum : OpMode() {
         if (gamepad1.right_trigger_pressed) {
             launcher.velocity = LAUNCHER_TARGET_VELOCITY.toDouble()
             if (launcher.velocity > LAUNCHER_MIN_VELOCITY) {
-                shoot_stop.power = -0.35
-                intake.power = 1.0
+                shoot_stop.power = -1.0
+                intake.power = 0.75
             }
         } else {
             launcher.velocity = 0.0
